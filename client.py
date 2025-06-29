@@ -1,83 +1,119 @@
-# client.py
-import base64, json, os, socket, sys, time
+# client.py – Upload / Download cloud simulation
+# Run: python client.py --mode upload   --file video.mp4
+#      python client.py --mode download --file video.mp4
+
+import argparse, base64, json, os, socket, sys, time
 from pathlib import Path
 import config, net_utils as nu
 from crypto_utils import CryptoUtils
+from ui_utils import print_requirement_table, StepTracker
+
+print_requirement_table()
 
 client_priv, client_pub = CryptoUtils.load_or_create_rsa("client")
 server_priv, server_pub = CryptoUtils.load_or_create_rsa("server")
 
-# --- Common helpers ---
+parser = argparse.ArgumentParser()
+parser.add_argument("--mode", choices=["upload", "download"], required=True)
+parser.add_argument("--file", default="video.mp4")
+args = parser.parse_args()
 
-def handshake(sock):
+def handshake(sock: socket.socket, tracker: StepTracker):
+    tracker.next("Handshake: Hello/Ready")
     nu._send_raw(sock, b"Hello!")
     if nu._recv_raw(sock) != b"Ready!":
-        raise RuntimeError("handshake failed")
+        nu.error("Handshake failed")
+        sys.exit(1)
+    nu.info("    -> OK")
 
-# --- Upload flow ---
-def upload(file_path: str):
-    data = Path(file_path).read_bytes()
-    session_key = os.urandom(32); iv = os.urandom(16)
-    cipher = CryptoUtils.aes_encrypt(session_key, iv, data)
-    file_hash = CryptoUtils.sha512(iv + cipher).hex()
-    meta = {"name": Path(file_path).name, "size": len(data), "timestamp": int(time.time())}
+def upload():
+    src = Path(args.file)
+    if not src.exists():
+        nu.error("File not found"); return
+    data = src.read_bytes()
+    steps = StepTracker(6)
+
+    steps.next("Encrypt file (AES-CBC)")
+    sk = os.urandom(32)
+    iv = os.urandom(16)
+    cipher = CryptoUtils.aes_encrypt(sk, iv, data)
+
+    steps.next("Sign metadata (RSA/SHA-512)")
+    meta = {"name": src.name, "size": len(data), "timestamp": int(time.time())}
     meta_json = json.dumps(meta, sort_keys=True).encode()
-    sig_meta = CryptoUtils.rsa_sign(client_priv, meta_json)
-    enc_sk = CryptoUtils.rsa_encrypt(server_pub, session_key)
+    sig_meta  = CryptoUtils.rsa_sign(client_priv, meta_json)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM); sock.settimeout(config.TIMEOUT)
-    sock.connect((config.HOST, config.PORT)); handshake(sock)
+    steps.next("Encrypt session key (RSA)")
+    enc_sk = CryptoUtils.rsa_encrypt(server_pub, sk)
 
+    steps.next("Connect to server")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(config.TIMEOUT)
+    sock.connect((config.HOST, config.PORT))
+    handshake(sock, steps)
+
+    steps.next("Send session-key packet")
     nu.send_json(sock, {"type": "KEY", "enc_sk": base64.b64encode(enc_sk).decode()})
     if nu.recv_json(sock).get("type") != "KEY-OK":
-        print("[ERR] server rejected session key"); return
+        nu.error("Server rejected session key"); return
+
+    steps.next("Send DATA & wait ACK")
     pkt = {
-        "type": "DATA","iv": base64.b64encode(iv).decode(),
+        "type":   "DATA",
+        "iv":     base64.b64encode(iv).decode(),
         "cipher": base64.b64encode(cipher).decode(),
-        "hash": file_hash,
-        "sig": base64.b64encode(sig_meta).decode(),
-        "meta": base64.b64encode(meta_json).decode(),
+        "hash":   CryptoUtils.sha512(iv + cipher).hex(),
+        "sig":    base64.b64encode(sig_meta).decode(),
+        "meta":   base64.b64encode(meta_json).decode(),
     }
-    for attempt in range(1, config.MAX_RETRY+1):
-        print(f"[SEND] attempt {attempt}")
+
+    for attempt in range(1, config.MAX_RETRY + 1):
+        nu.info(f"   attempt {attempt}")
         nu.send_json(sock, pkt)
         try:
-            resp = nu.recv_json(sock)
+            if nu.recv_json(sock).get("type") == "ACK":
+                steps.done("Upload")
+                break
         except socket.timeout:
-            print("[TIMEOUT] no ACK"); continue
-        if resp.get("type") == "ACK":
-            print("[OK] upload success"); break
-        print("[NACK] will retry")
+            nu.warn("   timeout; retry")
     else:
-        print("[FAIL] upload failed")
+        nu.error("Upload failed after retries")
 
-# --- Download flow ---
-def download(file_name: str):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM); sock.settimeout(config.TIMEOUT)
-    sock.connect((config.HOST, config.PORT)); handshake(sock)
-    sig = CryptoUtils.rsa_sign(client_priv, file_name.encode())
-    nu.send_json(sock, {"type": "DOWNLOAD", "file": file_name, "sig": base64.b64encode(sig).decode()})
+def download():
+    steps = StepTracker(5)
+    steps.next("Connect to server")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(config.TIMEOUT)
+    sock.connect((config.HOST, config.PORT))
+    handshake(sock, steps)
+
+    steps.next("Send signed download request")
+    req_sig = CryptoUtils.rsa_sign(client_priv, args.file.encode())
+    nu.send_json(sock, {
+        "type": "DOWNLOAD",
+        "file": args.file,
+        "sig":  base64.b64encode(req_sig).decode()
+    })
+
+    steps.next("Wait DATA packet")
     resp = nu.recv_json(sock)
     if resp.get("type") != "DATA":
-        print("[ERR] download rejected", resp); return
-    iv = base64.b64decode(resp["iv"]); cipher = base64.b64decode(resp["cipher"])
-    if CryptoUtils.sha512(iv+cipher).hex() != resp["hash"]:
-        print("[ERR] hash mismatch"); return
-    session_key = CryptoUtils.rsa_decrypt(client_priv, base64.b64decode(resp["enc_sk"]))
-    plain = CryptoUtils.aes_decrypt(session_key, iv, cipher)
-    out = Path("downloaded_" + file_name); out.write_bytes(plain)
+        nu.error("Server refused download"); return
+
+    steps.next("Verify hash & decrypt")
+    iv     = base64.b64decode(resp["iv"])
+    cipher = base64.b64decode(resp["cipher"])
+    if CryptoUtils.sha512(iv + cipher).hex() != resp["hash"]:
+        nu.error("Hash mismatch"); return
+    sk = CryptoUtils.rsa_decrypt(client_priv, base64.b64decode(resp["enc_sk"]))
+    plain = CryptoUtils.aes_decrypt(sk, iv, cipher)
+
+    Path("downloaded_" + args.file).write_bytes(plain)
     nu.send_json(sock, {"type": "ACK"})
-    print(f"[OK] downloaded to {out}")
+    steps.done("Download (saved to downloaded_" + args.file + ")")
 
-# --- Entry point for CLI ---
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["upload", "download"], required=True)
-    parser.add_argument("--file", default="video.mp4")
-    args = parser.parse_args()
-
     if args.mode == "upload":
-        upload(args.file)
+        upload()
     else:
-        download(args.file)
+        download()

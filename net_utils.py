@@ -1,12 +1,25 @@
+import json, random, socket, struct, sys, os, config
 
-import json, random, socket, struct
-import config
+# ---- ANSI màu (tự tắt trên CMD cũ) ----
+ANSI  = sys.platform != "win32" or "ANSICON" in os.environ or "WT_SESSION" in os.environ
+GREEN = "\033[32m" if ANSI else ""
+RED   = "\033[31m" if ANSI else ""
+YEL   = "\033[33m" if ANSI else ""
+RESET = "\033[0m"  if ANSI else ""
 
-# Length‑prefixed framing helpers
+def info(msg):  print(GREEN + msg + RESET, flush=True)
+def warn(msg):  print(YEL   + msg + RESET, flush=True)
+def error(msg): print(RED   + msg + RESET, flush=True)
 
+# ---- Length-prefixed framing (4-byte big-endian) ----
 def _send_raw(sock: socket.socket, data: bytes):
-    if random.random() < config.LOSS_RATE:
-        print("[SIM] Packet dropped (not sent)")
+    """
+    Gửi dữ liệu kèm chiều dài (4 byte). Control messages "Hello!" / "Ready!"
+    sẽ luôn được gửi; các gói khác có thể bị drop với xác suất LOSS_RATE
+    để mô phỏng lỗi mạng.
+    """
+    if data not in (b"Hello!", b"Ready!") and random.random() < config.LOSS_RATE:
+        warn("[SIM] Packet dropped (not sent)")
         return
     sock.sendall(struct.pack("!I", len(data)) + data)
 
